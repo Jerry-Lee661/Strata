@@ -2769,7 +2769,14 @@ class Vision:
 
     def __init__(self, cfg: dict, log=None, env: dict | None = None, lazy: bool = False):
         args = self.reader_args(cfg)
-        self.dir = self.work_dir()
+        d = cfg.get("dir")
+        if d:
+            self.dir = Path(d)
+            self.dir.mkdir(parents=True, exist_ok=True)
+            self.persistent = True
+        else:
+            self.dir = self.work_dir()
+            self.persistent = False
         self.spawn = (args, log, env)                   # to start it again after an unload
         # AMD: the GPU reader (strata-vision-hip) has the CPU reader (strata-vision, same program, no GPU runtime) to
         # fall back on when it does not start; _start switches to it by itself
@@ -2779,6 +2786,12 @@ class Vision:
         self.stopped = True
         self.lock = threading.Lock()
         self.cache: dict[str, tuple[Path, int]] = {}
+        if self.persistent:      # keep encodes across server restarts
+            for p in sorted(self.dir.glob("*.sve")):
+                try:
+                    self.cache[p.stem] = (p, int(p.with_suffix(".tok").read_text()))
+                except (OSError, ValueError):
+                    continue                                     # no count yet: encode again on demand
         # opt-in (the vision section's "elastic": true, with the config's "vram_elastic"): the encoder starts with the
         # first picture and stops after elastic_idle_s without one; while it runs, the engine's expert cache keeps
         # elastic_mib of VRAM free for it (Service._vision_up / _vision_idle_down)
@@ -3032,8 +3045,14 @@ class Vision:
             if not line.startswith("OK"):
                 raise ValueError("the image could not be read: " + (line[4:] if line.startswith("ERR") else
                                                                      "the vision encoder stopped"))
-            self.cache[key] = (out, int(line.split()[1]))
+            n = int(line.split()[1])
+            self.cache[key] = (out, n)
             self.warn_if_over_limit(self.cache[key][1])
+            try:
+                out.with_suffix(".tok").write_text(str(n))   # for the startup rebuild
+            except OSError:
+                pass
+
             held = {str(p) for p in keep} | {str(out)}
             for old in list(self.cache):                               # oldest first, but never one still in use
                 if len(self.cache) <= 64:
@@ -3075,7 +3094,8 @@ class Vision:
         """#914: close() for good: the server ends, so the encoder's directory (one ~10 MB .sve per image, on a tmpfs
         /tmp that is RAM) goes with it instead of piling up with every start.  unload() keeps it for the restart."""
         self.close()
-        shutil.rmtree(self.dir, ignore_errors=True)
+        if not self.persistent:
+            shutil.rmtree(self.dir, ignore_errors=True)
 
 
 def gpu_list(cfg: dict) -> list[int]:
